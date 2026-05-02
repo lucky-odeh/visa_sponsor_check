@@ -1,37 +1,26 @@
 /**
- * server.js
- * Visa Sponsor Checker UK — Express API
- *
- * Designed to run on Railway.
- * Reads DATABASE_URL from environment variables (set automatically by Railway
- * when you add a Supabase database connection).
+ * server.js - Visa Sponsor Checker UK
  */
-
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
 const { findSponsor } = require('./matcher');
+const { syncSponsors } = require('./sync');
 
 const app = express();
 const PORT = process.env.PORT || 8000;
 
-// ── Database ─────────────────────────────────────────────────────────────────
-// Railway sets DATABASE_URL automatically. Supabase requires SSL.
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
   max: 10,
 });
 
-// ── Middleware ────────────────────────────────────────────────────────────────
-app.use(cors()); // Allow requests from Chrome extension + any origin
+app.use(cors());
+app.use(express.json({ limit: '1mb' }));
 
-app.use(express.json());
-
-// ── Routes ────────────────────────────────────────────────────────────────────
-
-// Health check — Railway uses this to confirm the app started
 app.get('/', (req, res) => res.json({ status: 'ok', service: 'Visa Sponsor Checker UK' }));
+
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
@@ -41,7 +30,6 @@ app.get('/health', async (req, res) => {
   }
 });
 
-// Stats — total sponsor count for popup display
 app.get('/stats', async (req, res) => {
   try {
     const { rows } = await pool.query(
@@ -55,19 +43,15 @@ app.get('/stats', async (req, res) => {
   }
 });
 
-// Main endpoint — check if a company is a licensed sponsor
 app.post('/check-sponsor', async (req, res) => {
   const { company_name } = req.body;
-
   if (!company_name || typeof company_name !== 'string') {
     return res.status(400).json({ error: 'company_name is required' });
   }
-
   const name = company_name.trim();
   if (name.length < 2 || name.length > 200) {
     return res.status(400).json({ error: 'company_name length invalid' });
   }
-
   try {
     const result = await findSponsor(pool, name);
     res.json(result);
@@ -77,8 +61,28 @@ app.post('/check-sponsor', async (req, res) => {
   }
 });
 
-// ── Start ─────────────────────────────────────────────────────────────────────
+// Monthly sync endpoint — called by GitHub Actions
+app.post('/sync-sponsors', async (req, res) => {
+  const secret = req.headers['x-sync-secret'];
+  if (!secret || secret !== process.env.SYNC_SECRET) {
+    return res.status(401).json({ error: 'Unauthorised' });
+  }
+  const { csv_url } = req.body;
+  if (!csv_url || !csv_url.startsWith('https://assets.publishing.service.gov.uk')) {
+    return res.status(400).json({ error: 'Invalid csv_url' });
+  }
+  // Respond immediately, sync runs in background
+  res.json({ status: 'sync_started', csv_url });
+  try {
+    const result = await syncSponsors(csv_url);
+    console.log('[Sync] Complete:', result);
+  } catch (err) {
+    console.error('[Sync] Failed:', err.message);
+  }
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 Visa Sponsor Checker running on port ${PORT}`);
   console.log(`   DATABASE_URL: ${process.env.DATABASE_URL ? 'set ✓' : 'NOT SET ✗'}`);
+  console.log(`   SYNC_SECRET:  ${process.env.SYNC_SECRET ? 'set ✓' : 'NOT SET ✗'}`);
 });
